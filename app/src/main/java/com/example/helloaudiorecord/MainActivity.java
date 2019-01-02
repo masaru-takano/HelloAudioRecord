@@ -1,14 +1,19 @@
 package com.example.helloaudiorecord;
 
 import android.Manifest;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.pm.PackageManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
+import android.media.MediaMetadataRetriever;
 import android.media.MediaMuxer;
 import android.media.MediaRecorder;
+import android.os.Environment;
+import android.provider.MediaStore;
 import android.support.annotation.NonNull;
 import android.support.v4.content.ContextCompat;
 import android.support.v7.app.AppCompatActivity;
@@ -16,6 +21,7 @@ import android.os.Bundle;
 import android.util.Log;
 import android.widget.Toast;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
@@ -45,6 +51,12 @@ public class MainActivity extends AppCompatActivity {
 
     private MediaMuxer mMediaMuxer;
 
+    private Thread mAudioEncoderThread;
+
+    private Thread mAudioRecordThread;
+
+    private File mAudioFile;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -58,11 +70,20 @@ public class MainActivity extends AppCompatActivity {
         super.onResume();
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_PERMISSION);
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_PERMISSION);
             return;
         } else {
             setupAudioSource();
+
+            try {
+                setupMediaMuxer();
+            } catch (IOException e) {
+                error("Failed to setup media muxer.", e);
+            }
+
             try {
                 setupAudioEncoder();
             } catch (IOException e) {
@@ -92,36 +113,32 @@ public class MainActivity extends AppCompatActivity {
         super.onPause();
         stopRecording();
     }
-    
-    private MediaCodec.Callback mAudioEncoderCallback = new MediaCodec.Callback() {
-        @Override
-        public void onInputBufferAvailable(@NonNull MediaCodec codec, int index) {
-            // NOP.
-        }
 
-        @Override
-        public void onOutputBufferAvailable(@NonNull MediaCodec codec, int index, @NonNull MediaCodec.BufferInfo info) {
-            debug("onOutputBufferAvailable: ");
+    private File createAudioFile(final String fileName) throws IOException {
+        File file = new File(Environment.getExternalStorageDirectory(), fileName);
+        if (!file.exists()) {
+            if (!file.createNewFile()) {
+                throw new IOException();
+            }
         }
+        return file;
+    }
 
-        @Override
-        public void onError(@NonNull MediaCodec codec, @NonNull MediaCodec.CodecException e) {
-            error("onError: ", e);
+    private synchronized void setupMediaMuxer() throws IOException {
+        if (mMediaMuxer == null) {
+            File file = createAudioFile("test.mp4a");
+            mMediaMuxer = new MediaMuxer(file.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            mAudioFile = file;
         }
+    }
 
-        @Override
-        public void onOutputFormatChanged(@NonNull MediaCodec codec, @NonNull MediaFormat format) {
-            debug("onOutputFormatChanged: ");
-        }
-    };
-
-    private void setupAudioSource() {
+    private synchronized void setupAudioSource() {
         if (mAudioRecord == null) {
             mAudioRecord = new AudioRecord(AUDIO_SOURCE, AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_CONFIG, AUDIO_FORMAT, AUDIO_BUFFER_SIZE);
         }
     }
 
-    private void setupAudioEncoder() throws IOException {
+    private synchronized void setupAudioEncoder() throws IOException {
         if (mAudioEncoder != null) {
             return;
         }
@@ -132,13 +149,23 @@ public class MainActivity extends AppCompatActivity {
         format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1);
         mAudioEncoder = MediaCodec.createEncoderByType(AUDIO_MIME_TYPE);
         debug("Created Audio Encoder: name=" + mAudioEncoder.getName());
-        //mAudioEncoder.setCallback(mAudioEncoderCallback);
+
         mAudioEncoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
     }
 
-    private Thread mAudioRecordThread;
+    private boolean mRecording;
 
     private synchronized void startRecording() {
+        if (mRecording) {
+            return;
+        }
+        mRecording = true;
+
+        mAudioEncoder.start();
+        if (mAudioEncoderThread == null) {
+            mAudioEncoderThread = new Thread(new AudioEncoderTask());
+            mAudioEncoderThread.start();
+        }
         if (mAudioRecordThread == null) {
             mAudioRecordThread = new Thread(new AudioRecordTask());
             mAudioRecordThread.start();
@@ -146,9 +173,18 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private synchronized void stopRecording() {
+        if (!mRecording) {
+            return;
+        }
+        mRecording = false;
+
         if (mAudioRecordThread != null) {
             mAudioRecordThread.interrupt();
             mAudioRecordThread = null;
+        }
+        if (mAudioEncoderThread != null) {
+            mAudioEncoderThread.interrupt();
+            mAudioEncoderThread = null;
         }
     }
 
@@ -161,11 +197,70 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private class AudioRecordTask implements Runnable {
-
         @Override
         public void run() {
             debug("Start recording.");
-            mAudioEncoder.start();
+            MediaFormat format = mAudioEncoder.getOutputFormat();
+            int trackIx = mMediaMuxer.addTrack(format);
+            mMediaMuxer.start();
+
+            try {
+                final MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                final long timeoutUs = 1000 * 1000;
+
+                while (mRecording) {
+                    boolean interrupted = Thread.interrupted();
+                    int index = mAudioEncoder.dequeueOutputBuffer(info, timeoutUs);
+                    if (index > 0) {
+                        ByteBuffer outputBuffer = mAudioEncoder.getOutputBuffer(index);
+                        if (outputBuffer != null) {
+                            mMediaMuxer.writeSampleData(trackIx, outputBuffer, info);
+                            mAudioEncoder.releaseOutputBuffer(index, false);
+                            debug("Write sample data: size=" + info.size);
+                        }
+                    }
+                    if (interrupted) {
+                        break;
+                    }
+                }
+
+                mMediaMuxer.stop();
+
+                registerMedia(mAudioFile);
+            } catch (Throwable e) {
+                error("Unexpectedly shutdown.", e);
+            }
+        }
+
+        private void registerMedia(final File file) {
+            if (checkFile(file)) {
+                // Content Providerに登録する.
+                MediaMetadataRetriever mediaMeta = new MediaMetadataRetriever();
+                mediaMeta.setDataSource(file.toString());
+                ContentResolver resolver = getContentResolver();
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Video.Media.TITLE, file.getName());
+                values.put(MediaStore.Video.Media.DISPLAY_NAME, file.getName());
+                values.put(MediaStore.Video.Media.ARTIST, "No artist");
+                values.put(MediaStore.Video.Media.MIME_TYPE, AUDIO_MIME_TYPE);
+                values.put(MediaStore.Video.Media.DATA, file.toString());
+                resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+                debug("Registered audio file: " + mAudioFile.getAbsolutePath());
+            } else {
+                error("Failed to register audio file into content provider.", null);
+            }
+        }
+
+        private boolean checkFile(final @NonNull File file) {
+            return file.exists() && file.length() > 0;
+        }
+    }
+
+    private class AudioEncoderTask implements Runnable {
+
+        @Override
+        public void run() {
+            debug("Start encoding.");
             mAudioRecord.startRecording();
 
             final int bufferSize = 1024;
@@ -174,7 +269,7 @@ public class MainActivity extends AppCompatActivity {
             final long timeoutUs = 1000 * 1000;
 
             try {
-                while (true) {
+                while (mRecording) {
                     boolean interrupted = Thread.interrupted();
 
                     if ((len = mAudioRecord.read(data, 0, data.length)) > 0) {
@@ -198,7 +293,7 @@ public class MainActivity extends AppCompatActivity {
             } finally {
                 mAudioRecord.stop();
                 mAudioEncoder.stop();
-                debug("Stopped recording.");
+                debug("Stopped encoding.");
             }
         }
     }
